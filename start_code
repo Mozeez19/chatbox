@@ -1,0 +1,243 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+import re
+from urllib.parse import urljoin
+
+
+def scrape_main_table(url):
+    """Scrape the main table with links to individual initiatives"""
+    print(f"Scraping main table at: {url}")
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    # Find the table containing the initiatives
+    table = soup.find('table')
+    rows = table.find_all('tr')
+
+    initiatives = []
+
+    # Skip header row
+    for row in rows[1:]:
+        cells = row.find_all('td')
+        if len(cells) >= 2:  # Ensure we have enough cells
+            # Updated to look at the second column (index 1) instead of third
+            link_element = cells[1].find('a')
+            if link_element:
+                link = urljoin(url, link_element['href'])
+                initiatives.append({
+                    'number': cells[0].text.strip() if cells[0].text else "",
+                    'title': cells[1].text.strip() if cells[1].text else "",
+                    'link': link
+                })
+
+    return initiatives
+
+
+def scrape_initiative_details(initiative):
+    """Scrape details from an individual initiative page"""
+    url = initiative['link']
+    print(f"Scraping initiative: {initiative['number']} at {url}")
+
+    try:
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Get the title with the specified selector
+        title_element = soup.select_one('.mod-contentpagewide')
+        if title_element:
+            initiative['detailed_title'] = title_element.text.strip()
+        else:
+            initiative['detailed_title'] = "Title not found"
+
+        # Get the additional link
+        additional_link_element = soup.select_one('br+ a font')
+        if additional_link_element and additional_link_element.parent:
+            additional_link = urljoin(url, additional_link_element.parent['href'])
+            initiative['additional_link'] = additional_link
+
+            # Scrape the additional page
+            initiative.update(scrape_additional_page(additional_link))
+        else:
+            initiative['additional_link'] = "Link not found"
+
+        # Get table data
+        tables = soup.find_all('table')
+        table_data = []
+
+        for table in tables:
+            table_rows = []
+            rows = table.find_all('tr')
+
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if cells:
+                    table_rows.append([cell.text.strip() for cell in cells])
+
+            if table_rows:
+                table_data.append(table_rows)
+
+        initiative['tables'] = table_data
+
+        # Add a small delay to avoid overwhelming the server
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"Error scraping {url}: {str(e)}")
+        initiative['error'] = str(e)
+
+    return initiative
+
+
+def scrape_additional_page(url):
+    """Scrape content from the additional linked page"""
+    print(f"Scraping additional page: {url}")
+    result = {}
+
+    try:
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Extract title
+        title_element = soup.select_one('.mod-contentpagewide')
+        if title_element:
+            result['additional_page_title'] = title_element.text.strip()
+        else:
+            result['additional_page_title'] = "Additional title not found"
+
+        # Extract main content
+        content = soup.find('div', class_='mod-contentpagewide')
+        if content:
+            # Get all paragraphs and headings
+            text_elements = content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+            result['additional_content'] = '\n\n'.join([element.text.strip() for element in text_elements])
+        else:
+            result['additional_content'] = "No content found"
+
+        # Extract any tables
+        tables = soup.find_all('table')
+        table_data = []
+
+        for table in tables:
+            table_rows = []
+            rows = table.find_all('tr')
+
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if cells:
+                    table_rows.append([cell.text.strip() for cell in cells])
+
+            if table_rows:
+                table_data.append(table_rows)
+
+        result['additional_tables'] = table_data
+
+        # Add a small delay
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"Error scraping additional page {url}: {str(e)}")
+        result['additional_error'] = str(e)
+
+    return result
+
+
+def clean_text(text):
+    """Clean and normalize text"""
+    if not text:
+        return ""
+
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Remove special characters that might cause issues
+    text = re.sub(r'[^\w\s\.,;:!?&()\[\]\-\'"]', ' ', text)
+    return text
+
+
+def save_to_json(data, filename="initiatives_data.json"):
+    """Save the scraped data to JSON file"""
+    # Clean text data before saving
+    for initiative in data:
+        for key, value in initiative.items():
+            if isinstance(value, str):
+                initiative[key] = clean_text(value)
+            elif key == 'tables' or key == 'additional_tables':
+                for i, table in enumerate(value):
+                    for j, row in enumerate(table):
+                        value[i][j] = [clean_text(cell) for cell in row]
+
+    df = pd.DataFrame(data)
+    df.to_json(filename, orient='records', force_ascii=False, indent=4)
+    print(f"Data saved to {filename}")
+    return filename
+
+
+def process_for_llm(json_file="initiatives_data.json", output_file="initiatives_for_llm.txt"):
+    """Process the JSON data into a format suitable for training an LLM"""
+    df = pd.read_json(json_file)
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("# Swiss Popular Initiatives Dataset\n\n")
+
+        for _, row in df.iterrows():
+            f.write(f"## Initiative {row['number']}: {row['title']}\n\n")
+
+            if 'detailed_title' in row:
+                f.write(f"### Detailed Title\n{row['detailed_title']}\n\n")
+
+            if 'additional_page_title' in row:
+                f.write(f"### Additional Information\n{row['additional_page_title']}\n\n")
+
+            if 'additional_content' in row:
+                f.write(f"{row['additional_content']}\n\n")
+
+            if 'tables' in row and row['tables']:
+                f.write("### Initiative Tables\n")
+                for i, table in enumerate(row['tables']):
+                    f.write(f"\nTable {i + 1}:\n")
+                    for row_data in table:
+                        f.write(" | ".join(row_data) + "\n")
+                    f.write("\n")
+
+            if 'additional_tables' in row and row['additional_tables']:
+                f.write("### Additional Tables\n")
+                for i, table in enumerate(row['additional_tables']):
+                    f.write(f"\nTable {i + 1}:\n")
+                    for row_data in table:
+                        f.write(" | ".join(row_data) + "\n")
+                    f.write("\n")
+
+            f.write("-" * 80 + "\n\n")
+
+    print(f"Processed data for LLM saved to {output_file}")
+    return output_file
+
+
+def main():
+    main_url = "https://www.bk.admin.ch/ch/d/pore/vi/vis_1_3_1_1.html"
+
+    # Step 1: Scrape the main table
+    initiatives = scrape_main_table(main_url)
+    print(f"Found {len(initiatives)} initiatives")
+
+    # Optional: Limit the number of initiatives to scrape for testing
+    # initiatives = initiatives[:5]
+
+    # Step 2: Scrape each initiative page
+    detailed_initiatives = []
+    for initiative in initiatives:
+        detailed_initiative = scrape_initiative_details(initiative)
+        detailed_initiatives.append(detailed_initiative)
+
+    # Step 3: Save the data
+    json_file = save_to_json(detailed_initiatives)
+
+    # Step 4: Process for LLM
+    llm_file = process_for_llm(json_file)
+
+    print(f"Scraping complete! Data saved to {json_file} and processed for LLM in {llm_file}")
+
+
+if __name__ == "__main__":
+    main()
